@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, text
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,6 +32,10 @@ class Booking(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
+    idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
+    idempotency_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    idempotency_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 # Only confirmed bookings occupy a slot; cancelled rows remain in booking history.
@@ -40,4 +45,12 @@ CONFIRMED_BOOKING_INDEX = Index(
     unique=True,
     postgresql_where=text("status = 'confirmed'"),
     sqlite_where=text("status = 'confirmed'"),
+)
+
+IDEMPOTENCY_KEY_INDEX = Index(
+    "uq_bookings_idempotency_key",
+    Booking.idempotency_key,
+    unique=True,
+    postgresql_where=text("idempotency_key IS NOT NULL"),
+    sqlite_where=text("idempotency_key IS NOT NULL"),
 )

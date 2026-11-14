@@ -1,6 +1,6 @@
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
 
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import Base, get_db
 from app.migrate import migrate
-from app.main import app
+from app.main import app, list_bookings
 from app.models import Booking, CONFIRMED_BOOKING_INDEX, Slot
 
 
@@ -67,6 +67,19 @@ def sample_slots() -> list[dict[str, str]]:
     ]
 
 
+def appointment_slots(count: int) -> list[dict[str, str]]:
+    first_start = datetime(2026, 12, 10, 9, tzinfo=timezone.utc)
+    return [
+        {
+            "id": f"history-{index}",
+            "provider": "Dr Ade",
+            "start": (first_start + timedelta(days=index)).isoformat(),
+            "end": (first_start + timedelta(days=index, minutes=30)).isoformat(),
+        }
+        for index in range(count)
+    ]
+
+
 def is_utc(value: str) -> bool:
     timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return timestamp.utcoffset() == timezone.utc.utcoffset(None)
@@ -92,6 +105,7 @@ def test_reset_lists_slots_in_time_order_and_filters_provider(client: TestClient
         ("POST", "/reset", {"slots": []}),
         ("GET", "/slots", None),
         ("POST", "/bookings", {"slot_id": "s1", "name": "Ada", "email": "ada@example.com"}),
+        ("GET", "/bookings?email=ada@example.com", None),
         ("GET", "/bookings/missing", None),
         ("DELETE", "/bookings/missing", None),
     ],
@@ -191,6 +205,72 @@ def test_second_confirmed_booking_for_slot_returns_conflict(client: TestClient) 
     assert second.json() == {"error": "slot already booked"}
 
 
+def test_idempotent_retry_replays_original_booking(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    payload = {"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"}
+
+    original = client.post("/bookings", json=payload, headers={"Idempotency-Key": "retry-1"})
+    replay = client.post("/bookings", json=payload, headers={"Idempotency-Key": "retry-1"})
+
+    assert original.status_code == replay.status_code == 201
+    assert original.json() == replay.json()
+
+
+def test_idempotency_key_with_different_body_returns_unprocessable(
+    client: TestClient,
+) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    headers = {"Idempotency-Key": "different-body"}
+    first = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"},
+        headers=headers,
+    )
+
+    second = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Bola Obi", "email": "bola@example.com"},
+        headers=headers,
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 422
+    assert second.json() == {
+        "error": "Idempotency-Key was already used with a different request"
+    }
+
+
+def test_idempotent_retry_replays_original_response_after_cancellation(
+    client: TestClient,
+) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    payload = {"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"}
+    headers = {"Idempotency-Key": "cancelled-retry"}
+    original = client.post("/bookings", json=payload, headers=headers)
+    client.delete(f"/bookings/{original.json()['id']}")
+
+    replay = client.post("/bookings", json=payload, headers=headers)
+
+    assert replay.status_code == 201
+    assert replay.json() == original.json()
+
+
+def test_bookings_without_idempotency_key_still_work(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+
+    first = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"},
+    )
+    second = client.post(
+        "/bookings",
+        json={"slot_id": "s2", "name": "Bola Obi", "email": "bola@example.com"},
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+
+
 def test_database_index_rejects_duplicate_confirmed_bookings() -> None:
     test_engine = create_engine(
         URL.create("sqlite", database=":memory:"),
@@ -271,6 +351,37 @@ def test_migration_reports_preexisting_duplicate_confirmed_bookings() -> None:
         test_engine.dispose()
 
 
+def test_migration_adds_level_four_columns_to_existing_database() -> None:
+    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
+    with test_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE slots (id VARCHAR PRIMARY KEY, provider VARCHAR NOT NULL, "
+            "start DATETIME NOT NULL, end DATETIME NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE bookings (id VARCHAR PRIMARY KEY, slot_id VARCHAR NOT NULL, "
+            "name VARCHAR NOT NULL, email VARCHAR NOT NULL, status VARCHAR NOT NULL, "
+            "created_at DATETIME NOT NULL)"
+        )
+
+    try:
+        migrate(test_engine)
+        migrate(test_engine)
+
+        columns = {column["name"] for column in inspect(test_engine).get_columns("bookings")}
+        indexes = {index["name"] for index in inspect(test_engine).get_indexes("bookings")}
+        assert {
+            "idempotency_key",
+            "request_fingerprint",
+            "idempotency_response",
+            "idempotency_status_code",
+        } <= columns
+        assert "uq_bookings_one_confirmed_per_slot" in indexes
+        assert "uq_bookings_idempotency_key" in indexes
+    finally:
+        test_engine.dispose()
+
+
 def test_simultaneous_booking_requests_only_confirm_one(client: TestClient) -> None:
     client.post("/reset", json={"slots": sample_slots()})
     barrier = Barrier(2)
@@ -294,6 +405,181 @@ def test_simultaneous_booking_requests_only_confirm_one(client: TestClient) -> N
     assert next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")[
         "available"
     ] is False
+
+
+def test_simultaneous_requests_with_same_idempotency_key_replay_one_booking(
+    client: TestClient,
+) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    barrier = Barrier(2)
+    payload = {"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"}
+
+    def book():
+        barrier.wait()
+        return client.post(
+            "/bookings",
+            json=payload,
+            headers={"Idempotency-Key": "simultaneous-retry"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        requests = [executor.submit(book) for _ in range(2)]
+        responses = [request.result(timeout=30) for request in requests]
+
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json() == responses[1].json()
+
+
+def test_booking_history_filters_email_case_insensitively_and_orders_oldest_first(
+    client: TestClient,
+) -> None:
+    slots = appointment_slots(4)
+    client.post("/reset", json={"slots": slots})
+    created = []
+    for index, email in enumerate(
+        ["ADA@example.com", "other@example.com", "ada@example.com", "ada@example.com"]
+    ):
+        response = client.post(
+            "/bookings",
+            json={
+                "slot_id": slots[index]["id"],
+                "name": f"Patient {index}",
+                "email": email,
+            },
+        )
+        created.append(response.json())
+
+    history = client.get("/bookings", params={"email": "ADA@EXAMPLE.COM"}).json()
+
+    assert [booking["id"] for booking in history["bookings"]] == [
+        created[0]["id"],
+        created[2]["id"],
+        created[3]["id"],
+    ]
+    assert history["next_cursor"] is None
+
+
+def test_booking_history_default_limit_and_cursor_pagination(client: TestClient) -> None:
+    slots = appointment_slots(12)
+    client.post("/reset", json={"slots": slots})
+    created_ids = []
+    for index, slot in enumerate(slots):
+        created = client.post(
+            "/bookings",
+            json={
+                "slot_id": slot["id"],
+                "name": f"Patient {index}",
+                "email": "history@example.com",
+            },
+        )
+        created_ids.append(created.json()["id"])
+
+    first_page = client.get("/bookings", params={"email": "history@example.com"}).json()
+    assert len(first_page["bookings"]) == 10
+    assert first_page["next_cursor"] is not None
+
+    second_page = client.get(
+        "/bookings",
+        params={
+            "email": "history@example.com",
+            "cursor": first_page["next_cursor"],
+        },
+    ).json()
+
+    assert len(second_page["bookings"]) == 2
+    assert second_page["next_cursor"] is None
+    assert [
+        booking["id"] for booking in first_page["bookings"] + second_page["bookings"]
+    ] == created_ids
+
+
+def test_booking_history_cursor_uses_id_to_break_timestamp_ties() -> None:
+    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
+    Base.metadata.create_all(test_engine)
+    test_session = sessionmaker(bind=test_engine, expire_on_commit=False)
+    timestamp = datetime(2026, 12, 1, 10, tzinfo=timezone.utc)
+
+    try:
+        with test_session.begin() as db:
+            for suffix in ("a", "b", "c"):
+                db.add(
+                    Slot(
+                        id=f"tie-{suffix}",
+                        provider="Dr Ade",
+                        start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
+                        end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
+                    )
+                )
+                db.add(
+                    Booking(
+                        id=f"booking-{suffix}",
+                        slot_id=f"tie-{suffix}",
+                        name=f"Patient {suffix}",
+                        email="ties@example.com",
+                        created_at=timestamp,
+                    )
+                )
+
+        with test_session() as db:
+            first = list_bookings("ties@example.com", 2, None, db)
+            second = list_bookings(
+                "ties@example.com", 2, first.next_cursor, db
+            )
+
+        assert [booking.id for booking in first.bookings] == [
+            "booking-a",
+            "booking-b",
+        ]
+        assert [booking.id for booking in second.bookings] == ["booking-c"]
+        assert second.next_cursor is None
+    finally:
+        test_engine.dispose()
+
+
+def test_booking_history_supports_custom_limit_and_rejects_invalid_limits(
+    client: TestClient,
+) -> None:
+    slots = appointment_slots(4)
+    client.post("/reset", json={"slots": slots})
+    for index, slot in enumerate(slots):
+        client.post(
+            "/bookings",
+            json={
+                "slot_id": slot["id"],
+                "name": f"Patient {index}",
+                "email": "history@example.com",
+            },
+        )
+
+    page = client.get(
+        "/bookings",
+        params={"email": "history@example.com", "limit": 2},
+    ).json()
+    assert len(page["bookings"]) == 2
+    assert page["next_cursor"] is not None
+
+    for invalid_limit in ["0", "51", "not-a-number"]:
+        response = client.get(
+            "/bookings",
+            params={"email": "history@example.com", "limit": invalid_limit},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]
+
+
+def test_booking_history_requires_email_and_rejects_invalid_cursor(
+    client: TestClient,
+) -> None:
+    missing_email = client.get("/bookings")
+    invalid_cursor = client.get(
+        "/bookings",
+        params={"email": "history@example.com", "cursor": "not-a-cursor"},
+    )
+
+    assert missing_email.status_code == 400
+    assert missing_email.json() == {"error": "email is required"}
+    assert invalid_cursor.status_code == 400
+    assert invalid_cursor.json() == {"error": "invalid booking cursor"}
 
 
 def test_cancel_booking_frees_slot_for_rebooking(client: TestClient) -> None:

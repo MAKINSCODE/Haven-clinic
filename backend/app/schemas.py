@@ -79,6 +79,11 @@ class BookingResponse(BaseModel):
         return as_utc(value)
 
 
+class BookingHistoryResponse(BaseModel):
+    bookings: list[BookingResponse]
+    next_cursor: str | None
+
+
 class ErrorResponse(BaseModel):
     error: str
 
