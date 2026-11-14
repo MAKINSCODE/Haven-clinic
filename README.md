@@ -21,11 +21,8 @@ Set `DATABASE_URL` to a Neon PostgreSQL connection string. If it is unset, the
 backend uses a local SQLite database at `backend\clinic.db`.
 
 Set `API_KEY` in the backend environment before starting the API. Every API
-route requires this value in the `X-API-Key` request header. Do not put this
-secret in React/browser code; when the patient UI is implemented, its requests
-must pass through a server-side function configured with the same environment
-variable. The current frontend files are placeholders and do not contain a
-booking flow.
+route requires this value in the `X-API-Key` request header. The React frontend
+uses a server-side proxy to add this key; it is never included in browser code.
 
 Run the seed script once to create the tables and insert fictional sample slots:
 
@@ -81,3 +78,26 @@ Run from the `backend` directory:
 ```powershell
 pytest
 ```
+
+## React frontend
+
+Start the backend from the `backend` directory as described above. Then, in a
+second terminal, configure and start the frontend:
+
+```powershell
+cd ..\frontend
+Copy-Item .env.example .env.local
+npm install
+npm run dev
+```
+
+Set `API_KEY` in `frontend\.env.local` to the same value configured for the
+backend. `BACKEND_API_URL` defaults to `http://127.0.0.1:8000`; change it if
+the API is running elsewhere. The Vite development proxy reads these values
+server-side. For a Vercel deployment, configure `BACKEND_API_URL` and `API_KEY`
+as server environment variables for the frontend project.
+
+The UI loads available providers and appointment times from `GET /slots`,
+creates bookings with `POST /bookings`, and uses the existing booking lookup,
+history, and cancellation endpoints. No mock slot or booking data is duplicated
+in the frontend.
