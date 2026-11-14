@@ -1,0 +1,47 @@
+from datetime import datetime
+
+from sqlalchemy import select
+
+from app.db import Base, SessionLocal, engine
+from app.models import Slot
+
+
+SEED_SLOTS = [
+    ("slot-001", "Dr Ade", "2026-12-10T09:00:00+00:00", "2026-12-10T09:30:00+00:00"),
+    ("slot-002", "Dr Ade", "2026-12-10T14:00:00+00:00", "2026-12-10T14:30:00+00:00"),
+    ("slot-003", "Dr Ade", "2026-12-11T10:00:00+00:00", "2026-12-11T10:30:00+00:00"),
+    ("slot-004", "Dr Bello", "2026-12-10T09:30:00+00:00", "2026-12-10T10:00:00+00:00"),
+    ("slot-005", "Dr Bello", "2026-12-11T13:00:00+00:00", "2026-12-11T13:30:00+00:00"),
+    ("slot-006", "Dr Bello", "2026-12-12T15:00:00+00:00", "2026-12-12T15:30:00+00:00"),
+    ("slot-007", "Dr Chen", "2026-12-10T11:00:00+00:00", "2026-12-10T11:30:00+00:00"),
+    ("slot-008", "Dr Chen", "2026-12-12T09:00:00+00:00", "2026-12-12T09:30:00+00:00"),
+    ("slot-009", "Dr Chen", "2026-12-12T14:30:00+00:00", "2026-12-12T15:00:00+00:00"),
+    ("slot-010", "Dr Okafor", "2026-12-11T09:00:00+00:00", "2026-12-11T09:30:00+00:00"),
+    ("slot-011", "Dr Okafor", "2026-12-11T15:00:00+00:00", "2026-12-11T15:30:00+00:00"),
+    ("slot-012", "Dr Okafor", "2026-12-13T10:00:00+00:00", "2026-12-13T10:30:00+00:00"),
+    ("slot-013", "Dr Patel", "2026-12-10T13:00:00+00:00", "2026-12-10T13:30:00+00:00"),
+    ("slot-014", "Dr Patel", "2026-12-12T11:00:00+00:00", "2026-12-12T11:30:00+00:00"),
+    ("slot-015", "Dr Patel", "2026-12-13T14:00:00+00:00", "2026-12-13T14:30:00+00:00"),
+]
+
+
+def seed() -> None:
+    Base.metadata.create_all(engine)
+    with SessionLocal.begin() as db:
+        existing_ids = set(db.scalars(select(Slot.id)).all())
+        db.add_all(
+            [
+                Slot(
+                    id=slot_id,
+                    provider=provider,
+                    start_at=datetime.fromisoformat(start),
+                    end_at=datetime.fromisoformat(end),
+                )
+                for slot_id, provider, start, end in SEED_SLOTS
+                if slot_id not in existing_ids
+            ]
+        )
+
+
+if __name__ == "__main__":
+    seed()
