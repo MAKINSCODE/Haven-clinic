@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, EmailStr, ValidationInfo, field_validator
 
 from app.models import Slot
 
@@ -46,7 +46,23 @@ class SlotAvailability(SlotResponse):
 class NewBooking(BaseModel):
     slot_id: str
     name: str
-    email: str
+    email: EmailStr
+
+    @field_validator("slot_id", "name", "email", mode="before")
+    @classmethod
+    def normalize_required_values(cls, value: object, info: ValidationInfo) -> object:
+        if not isinstance(value, str):
+            return value
+
+        trimmed_value = value.strip()
+        if not trimmed_value:
+            raise ValueError(f"{info.field_name} must not be empty")
+        if info.field_name == "slot_id":
+            return value
+        # Normalize patient-entered text before validating and storing it.
+        if info.field_name == "email":
+            return trimmed_value.lower()
+        return trimmed_value
 
 
 class BookingResponse(BaseModel):

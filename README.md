@@ -1,6 +1,6 @@
 # Clinic Appointment Booking System
 
-## Level 1: basic booking API
+## Level 2: authenticated booking API
 
 This level implements the basic REST API with a FastAPI backend, SQLAlchemy
 models, and PostgreSQL support. Exactly two tables are used: `slots` and
@@ -19,6 +19,13 @@ pip install -r requirements.txt
 
 Set `DATABASE_URL` to a Neon PostgreSQL connection string. If it is unset, the
 backend uses a local SQLite database at `backend\clinic.db`.
+
+Set `API_KEY` in the backend environment before starting the API. Every API
+route requires this value in the `X-API-Key` request header. Do not put this
+secret in React/browser code; when the patient UI is implemented, its requests
+must pass through a server-side function configured with the same environment
+variable. The current frontend files are placeholders and do not contain a
+booking flow.
 
 Run the seed script once to create the tables and insert fictional sample slots:
 
@@ -41,6 +48,10 @@ Available routes:
 - `GET /slots` with an optional exact-match `provider` query
 - `POST /bookings`
 - `GET /bookings/{id}`
+
+Booking requests require a non-empty `slot_id`, `name`, and valid `email`.
+Names and emails are trimmed, emails are stored lowercase, and bookings are
+rejected if their slot does not exist or has already started.
 
 ### Tests
 
