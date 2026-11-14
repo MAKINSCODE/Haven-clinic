@@ -1,23 +1,30 @@
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.engine import URL
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.db import Base, get_db
+from app.migrate import migrate
 from app.main import app
+from app.models import Booking, CONFIRMED_BOOKING_INDEX, Slot
 
 
 @pytest.fixture()
-def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+def client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Generator[TestClient, None, None]:
     monkeypatch.setenv("API_KEY", "test-api-key")
     test_engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        URL.create("sqlite", database=str(tmp_path / "test.db")),
+        connect_args={"check_same_thread": False, "timeout": 15},
     )
     testing_session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     Base.metadata.create_all(test_engine)
@@ -86,6 +93,7 @@ def test_reset_lists_slots_in_time_order_and_filters_provider(client: TestClient
         ("GET", "/slots", None),
         ("POST", "/bookings", {"slot_id": "s1", "name": "Ada", "email": "ada@example.com"}),
         ("GET", "/bookings/missing", None),
+        ("DELETE", "/bookings/missing", None),
     ],
 )
 @pytest.mark.parametrize("api_key", [None, "incorrect-key"])
@@ -164,6 +172,172 @@ def test_create_and_retrieve_booking_marks_slot_unavailable(client: TestClient) 
     assert client.get(f"/bookings/{booking['id']}").json() == booking
     slot = next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")
     assert slot["available"] is False
+
+
+def test_second_confirmed_booking_for_slot_returns_conflict(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    first = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"},
+    )
+
+    second = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Bola Obi", "email": "bola@example.com"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json() == {"error": "slot already booked"}
+
+
+def test_database_index_rejects_duplicate_confirmed_bookings() -> None:
+    test_engine = create_engine(
+        URL.create("sqlite", database=":memory:"),
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(test_engine)
+    test_session = sessionmaker(bind=test_engine, expire_on_commit=False)
+
+    try:
+        with test_session.begin() as db:
+            db.add(
+                Slot(
+                    id="indexed",
+                    provider="Dr Ade",
+                    start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
+                    end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with test_session.begin() as db:
+                db.add_all(
+                    [
+                        Booking(slot_id="indexed", name="One", email="one@example.com"),
+                        Booking(slot_id="indexed", name="Two", email="two@example.com"),
+                    ]
+                )
+                db.flush()
+    finally:
+        test_engine.dispose()
+
+
+def test_migration_adds_confirmed_booking_index_idempotently() -> None:
+    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
+    Base.metadata.create_all(test_engine)
+    CONFIRMED_BOOKING_INDEX.drop(test_engine, checkfirst=True)
+
+    try:
+        migrate(test_engine)
+        migrate(test_engine)
+
+        indexes = inspect(test_engine).get_indexes("bookings")
+        assert any(
+            index["name"] == "uq_bookings_one_confirmed_per_slot"
+            and index["unique"]
+            for index in indexes
+        )
+    finally:
+        test_engine.dispose()
+
+
+def test_migration_reports_preexisting_duplicate_confirmed_bookings() -> None:
+    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
+    Base.metadata.create_all(test_engine)
+    CONFIRMED_BOOKING_INDEX.drop(test_engine, checkfirst=True)
+    test_session = sessionmaker(bind=test_engine, expire_on_commit=False)
+
+    try:
+        with test_session.begin() as db:
+            db.add(
+                Slot(
+                    id="duplicate",
+                    provider="Dr Ade",
+                    start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
+                    end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
+                )
+            )
+        with test_session.begin() as db:
+            db.add_all(
+                [
+                    Booking(slot_id="duplicate", name="One", email="one@example.com"),
+                    Booking(slot_id="duplicate", name="Two", email="two@example.com"),
+                ]
+            )
+
+        with pytest.raises(RuntimeError, match="multiple confirmed bookings"):
+            migrate(test_engine)
+    finally:
+        test_engine.dispose()
+
+
+def test_simultaneous_booking_requests_only_confirm_one(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    barrier = Barrier(2)
+
+    def book(name: str, email: str):
+        barrier.wait()
+        return client.post(
+            "/bookings",
+            json={"slot_id": "s1", "name": name, "email": email},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        requests = [
+            executor.submit(book, "Ada Obi", "ada@example.com"),
+            executor.submit(book, "Bola Obi", "bola@example.com"),
+        ]
+        responses = [request.result(timeout=30) for request in requests]
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert sum(response.json().get("status") == "confirmed" for response in responses) == 1
+    assert next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")[
+        "available"
+    ] is False
+
+
+def test_cancel_booking_frees_slot_for_rebooking(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    created = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"},
+    )
+    booking_id = created.json()["id"]
+
+    cancelled = client.delete(f"/bookings/{booking_id}")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")[
+        "available"
+    ] is True
+    rebooked = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Bola Obi", "email": "bola@example.com"},
+    )
+    assert rebooked.status_code == 201
+
+
+def test_cancel_booking_returns_not_found_for_unknown_id(client: TestClient) -> None:
+    response = client.delete("/bookings/unknown")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "booking not found"}
+
+
+def test_cancel_booking_returns_conflict_if_already_cancelled(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    created = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"},
+    )
+    booking_id = created.json()["id"]
+    assert client.delete(f"/bookings/{booking_id}").status_code == 200
+
+    response = client.delete(f"/bookings/{booking_id}")
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "booking already cancelled"}
 
 
 def test_unknown_booking_returns_json_error(client: TestClient) -> None:

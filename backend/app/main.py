@@ -5,7 +5,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import require_api_key
@@ -80,6 +81,26 @@ def as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def lock_slot(db: Session, slot_id: str) -> Slot | None:
+    if db.bind is not None and db.bind.dialect.name == "sqlite":
+        # SQLite ignores FOR UPDATE, so take its write lock before reading the slot.
+        db.execute(update(Slot).where(Slot.id == slot_id).values(id=Slot.id))
+    return db.scalar(select(Slot).where(Slot.id == slot_id).with_for_update())
+
+
+def lock_booking(db: Session, booking_id: str) -> Booking | None:
+    if db.bind is not None and db.bind.dialect.name == "sqlite":
+        # Serialize cancellation requests because SQLite does not implement FOR UPDATE.
+        db.execute(
+            update(Booking)
+            .where(Booking.id == booking_id)
+            .values(status=Booking.status)
+        )
+    return db.scalar(
+        select(Booking).where(Booking.id == booking_id).with_for_update()
+    )
+
+
 @app.post("/reset", status_code=200, response_class=Response)
 def reset(request: ResetRequest, db: Session = Depends(get_db)) -> Response:
     # Keep deleting bookings and replacing slots atomic if inserting new slots fails.
@@ -129,22 +150,68 @@ def list_slots(
 
 @app.post("/bookings", response_model=BookingResponse, status_code=201)
 def create_booking(booking: NewBooking, db: Session = Depends(get_db)) -> Booking:
-    slot = db.get(Slot, booking.slot_id)
-    if slot is None:
-        raise HTTPException(status_code=404, detail="slot not found")
-    if as_utc(slot.start_at) <= current_utc_time():
-        raise HTTPException(status_code=400, detail="appointment has already started")
+    try:
+        with db.begin():
+            slot = lock_slot(db, booking.slot_id)
+            if slot is None:
+                raise HTTPException(status_code=404, detail="slot not found")
+            if as_utc(slot.start_at) <= current_utc_time():
+                raise HTTPException(status_code=400, detail="appointment has already started")
 
-    record = Booking(
-        slot_id=booking.slot_id,
-        name=booking.name,
-        email=booking.email,
-        status="confirmed",
-    )
-    db.add(record)
-    db.commit()
+            existing_booking = db.scalar(
+                select(Booking.id)
+                .where(
+                    Booking.slot_id == booking.slot_id,
+                    Booking.status == "confirmed",
+                )
+                .limit(1)
+            )
+            if existing_booking is not None:
+                raise HTTPException(status_code=409, detail="slot already booked")
+
+            record = Booking(
+                slot_id=booking.slot_id,
+                name=booking.name,
+                email=booking.email,
+                status="confirmed",
+            )
+            db.add(record)
+            db.flush()
+    except IntegrityError:
+        # The partial unique index is the final guard against overlapping inserts.
+        db.rollback()
+        conflicting_booking = db.scalar(
+            select(Booking.id).where(
+                Booking.slot_id == booking.slot_id,
+                Booking.status == "confirmed",
+            )
+        )
+        if conflicting_booking is not None:
+            raise HTTPException(status_code=409, detail="slot already booked")
+        raise
+
     db.refresh(record)
     return record
+
+
+@app.delete(
+    "/bookings/{booking_id}",
+    response_model=BookingResponse,
+    responses={
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+def cancel_booking(booking_id: str, db: Session = Depends(get_db)) -> Booking:
+    with db.begin():
+        booking = lock_booking(db, booking_id)
+        if booking is None:
+            raise HTTPException(status_code=404, detail="booking not found")
+        if booking.status == "cancelled":
+            raise HTTPException(status_code=409, detail="booking already cancelled")
+        booking.status = "cancelled"
+        db.flush()
+    return booking
 
 
 @app.get(

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,3 +31,13 @@ class Booking(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
+
+
+# Only confirmed bookings occupy a slot; cancelled rows remain in booking history.
+CONFIRMED_BOOKING_INDEX = Index(
+    "uq_bookings_one_confirmed_per_slot",
+    Booking.slot_id,
+    unique=True,
+    postgresql_where=text("status = 'confirmed'"),
+    sqlite_where=text("status = 'confirmed'"),
+)
