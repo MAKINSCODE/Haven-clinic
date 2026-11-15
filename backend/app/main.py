@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import Engine, and_, delete, func, or_, select, text, update
+from sqlalchemy import Engine, and_, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -102,7 +102,7 @@ def current_utc_time() -> datetime:
 
 
 def as_utc(value: datetime) -> datetime:
-    # SQLite drops timezone metadata from DateTime columns; persisted values are UTC.
+    # Treat naive database timestamps as UTC for consistent API comparisons.
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
@@ -122,23 +122,10 @@ def record_booking_attempt(bind: Engine, email: str) -> int | None:
 
     with Session(bind=bind) as db:
         with db.begin():
-            dialect_name = bind.dialect.name
-            if dialect_name == "sqlite":
-                # SQLite has no row-level locks; a write serializes rate-limit checks.
-                db.execute(
-                    update(BookingAttempt)
-                    .where(BookingAttempt.id == "__rate_limit_write_lock__")
-                    .values(attempted_at=BookingAttempt.attempted_at)
-                )
-            elif dialect_name == "postgresql":
-                db.execute(
-                    text("SELECT pg_advisory_xact_lock(CAST(:lock_id AS BIGINT))"),
-                    {"lock_id": lock_id},
-                )
-            else:
-                raise RuntimeError(
-                    f"Unsupported database dialect for rate limiting: {dialect_name}"
-                )
+            db.execute(
+                text("SELECT pg_advisory_xact_lock(CAST(:lock_id AS BIGINT))"),
+                {"lock_id": lock_id},
+            )
 
             now = current_utc_time()
             cutoff = now - BOOKING_ATTEMPT_WINDOW
@@ -202,20 +189,10 @@ async def enforce_booking_attempt_limit(
 
 
 def lock_slot(db: Session, slot_id: str) -> Slot | None:
-    if db.bind is not None and db.bind.dialect.name == "sqlite":
-        # SQLite ignores FOR UPDATE, so take its write lock before reading the slot.
-        db.execute(update(Slot).where(Slot.id == slot_id).values(id=Slot.id))
     return db.scalar(select(Slot).where(Slot.id == slot_id).with_for_update())
 
 
 def lock_booking(db: Session, booking_id: str) -> Booking | None:
-    if db.bind is not None and db.bind.dialect.name == "sqlite":
-        # Serialize cancellation requests because SQLite does not implement FOR UPDATE.
-        db.execute(
-            update(Booking)
-            .where(Booking.id == booking_id)
-            .values(status=Booking.status)
-        )
     return db.scalar(
         select(Booking).where(Booking.id == booking_id).with_for_update()
     )
@@ -367,8 +344,7 @@ def create_booking(
 
     try:
         with db.begin():
-            is_sqlite = db.bind is not None and db.bind.dialect.name == "sqlite"
-            if idempotency_key is not None and not is_sqlite:
+            if idempotency_key is not None:
                 existing = db.scalar(
                     select(Booking).where(Booking.idempotency_key == idempotency_key)
                 )
@@ -376,8 +352,7 @@ def create_booking(
                     replay = replay_idempotent_booking(existing, fingerprint, response)
 
             if replay is None:
-                # On SQLite, lock before any read so concurrent retries do not race to
-                # upgrade simultaneous read transactions into write transactions.
+                # Lock before reading so concurrent retries cannot both create a booking.
                 slot = lock_slot(db, booking.slot_id)
                 if idempotency_key is not None:
                     existing = db.scalar(

@@ -1,208 +1,157 @@
-# Clinic Appointment Booking System
+# Haven Clinic Appointment Booking
 
-## Level 5: booking API, idempotency, history, and rate limiting
+Haven Clinic helps patients find, book, and manage appointments.
 
-The FastAPI backend uses SQLAlchemy and supports PostgreSQL. The `slots` and
-`bookings` tables store appointment data; `booking_attempts` stores hashed-email
-attempt timestamps for rate limiting.
+## The problem
 
-### Setup
+Patients need a simple way to book appointments, while the clinic needs reliable
+availability, safe handling of retries and concurrent requests, and searchable
+booking records.
 
-From the `backend` directory, create and activate a virtual environment and
-install dependencies:
+## The solution
+
+A React frontend and FastAPI backend use one persistent Supabase PostgreSQL
+database. The API enforces booking rules. A server-side proxy keeps the API key
+out of browser code. The backend requires PostgreSQL and loads `DATABASE_URL`
+from `backend\.env` locally.
+
+## Development levels
+
+1. **Basic API:** Store slots and bookings; list availability and create bookings.
+2. **Authentication and validation:** Require an API key; validate and normalize
+   booking details.
+3. **Booking protection:** Prevent double bookings, handle concurrent requests,
+   and allow cancellations to free slots.
+4. **Idempotency and history:** Safely replay retries, find bookings by ID, and
+   page through email-filtered history.
+5. **Rate limiting and patient flows:** Limit attempts per email and complete
+   frontend booking, lookup, history, and cancellation flows.
+
+## Challenges and engineering decisions
+
+- PostgreSQL row locks and partial unique indexes protect slot availability.
+- Idempotency keys and normalized request fingerprints make retries safe.
+- Email normalization and stable cursor ordering make history predictable.
+- The API key stays server-side; rate-limit records store an HMAC of email.
+- Tests use temporary PostgreSQL schemas, keeping the project on one database
+  engine.
+
+## Result
+
+Patients can view provider-filtered availability, book an appointment, find it
+by ID or email, review paginated history, and cancel a confirmed booking.
+Invalid or unavailable slots are rejected; the sixth booking attempt for an
+email within one minute receives HTTP `429`. Fictional sample slots are
+available for development.
+
+**Stack:** React, Vite, Python 3.12, FastAPI, SQLAlchemy, Psycopg,
+Supabase PostgreSQL, and Vercel.
+
+## Run locally
+
+Use Python 3.12, Node.js, npm, and a Supabase PostgreSQL project reserved for
+development/testing. Never run local tests against production.
+
+### Configure PostgreSQL
+
+From `backend`, create `.env` from the root example:
+
+```powershell
+Copy-Item ..\.env.example .env
+```
+
+Set `DATABASE_URL` to the Supabase Dashboard connection string and `API_KEY`
+to a long random secret. Use a pooler URL if a direct connection is unavailable.
+Keep `.env` private.
+
+Apply migrations only after reviewing the target project and migration history:
+
+```powershell
+npx --yes supabase@3.1.0 login
+npx --yes supabase@3.1.0 link --project-ref "your-project-ref"
+npx --yes supabase@3.1.0 db push --remote
+```
+
+`--remote` targets the linked hosted project. Apply the baseline migration only
+to a new, empty database. Reconcile existing tables without migration history
+before pushing. For an existing database with the original `slots` and
+`bookings` tables, run `python -m app.migrate` from `backend` to add the newer
+booking and rate-limit storage.
+
+### Start the backend
+
+From `backend`:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-Set `DATABASE_URL` to a Supabase PostgreSQL connection string for a development
-or test project. If it is unset, the
-backend uses a local SQLite database at `backend\clinic.db`.
-
-Set `API_KEY` in the backend environment before starting the API. Every API
-route requires this value in the `X-API-Key` request header. The React frontend
-uses a server-side proxy to add this key; it is never included in browser code.
-
-Run the seed script once to create the tables and insert fictional sample slots:
-
-```powershell
 python -m app.seed
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The script adds its sample slot IDs only when they are not already present. It
-does not run automatically when the API starts.
+The seed command adds missing fictional slots; it does not clear bookings or
+replace existing slots.
 
-After deploying the latest code to an existing database, run this migration
-once before serving booking requests. It adds the partial unique indexes and
-nullable idempotency columns to `bookings`, and creates the `booking_attempts`
-table and its indexes:
+### Start the frontend
 
-```powershell
-python -m app.migrate
-```
-
-The migration stops with an explicit error if the database already contains
-multiple confirmed bookings for a slot or duplicate non-null idempotency keys;
-resolve those records before retrying.
-
-Start the API from the `backend` directory:
+In another terminal:
 
 ```powershell
-uvicorn app.main:app --reload
-```
-
-Available routes:
-
-- `POST /reset`
-- `GET /slots` with an optional exact-match `provider` query
-- `POST /bookings`
-- `GET /bookings/{id}`
-- `DELETE /bookings/{id}` to cancel a booking
-- `GET /bookings?email=...` with optional `limit` and `cursor`
-
-Booking requests require a non-empty `slot_id`, `name`, and valid `email`.
-Names and emails are trimmed, emails are stored lowercase, and bookings are
-rejected if their slot does not exist, has already started, or has another
-confirmed booking. Cancelling a booking makes its slot available again.
-
-`POST /bookings` accepts an optional `Idempotency-Key` header. Reusing the key
-with the same normalized request replays the original booking response; using
-it with a different request returns `422`. Booking history is filtered by
-email, ordered oldest first, and uses an opaque cursor based on creation time
-and booking ID. The `limit` is between 1 and 50 and defaults to 10.
-
-`GET /slots` returns `{"slots": [...]}`. `POST /bookings` limits each email to
-five attempts in a rolling minute, including requests that later fail booking
-validation or rules. The sixth attempt returns `429` and a `Retry-After`
-header. Attempt records contain an HMAC of the normalized email, not the email
-itself, and expired records are removed as new attempts arrive.
-
-## Supabase CLI and PostgreSQL
-
-The Supabase CLI project config is in `supabase\`. Run the pinned CLI version
-through `npx` (Node.js 20 or later) without installing a global executable:
-
-```powershell
-npx --yes supabase@3.1.0 --version
-```
-
-Create a new development/test project in the Supabase Dashboard and save its
-database password securely. From the repository root, authenticate and link
-the CLI. `login` prompts for a Supabase personal access token; `link` prompts
-for the database password. Do not put either secret in Git or in browser code.
-
-```powershell
-npx --yes supabase@3.1.0 login
-npx --yes supabase@3.1.0 link --project-ref "your-project-ref"
-```
-
-The initial migration creates the `slots` and `bookings` tables, booking
-uniqueness indexes, and row-level security. The later rate-limiting migration
-creates `booking_attempts` and its indexes, also with row-level security and
-revoked direct table access. The FastAPI backend connects with server-side
-PostgreSQL credentials. Review the migrations, then apply them to the linked
-hosted project with
-`--remote`. Without that flag, the CLI targets the local Supabase stack and
-requires Docker. Apply the baseline migration only to a new, empty project.
-On an existing project with the initial migration recorded, this applies only
-new migrations:
-
-```powershell
-npx --yes supabase@3.1.0 db push --remote
-```
-
-Set `DATABASE_URL` in the backend terminal to the connection string from the
-Supabase Dashboard's **Connect** dialog. If a direct connection is unavailable
-on your network, use a Supabase pooler connection string. Run the existing
-seed script only when you intentionally want to add its sample slots:
-
-```powershell
-Set-Location backend
-$env:DATABASE_URL = "paste-your-development-project-connection-string-here"
-python -m app.seed
-```
-
-The CLI's `supabase\seed.sql` mirrors `backend\app\seed.py` for local Supabase
-resets. Remote database initialization uses the Python seed command above.
-Do not run the baseline migration against a project that already has these
-tables; inspect and pull an existing schema first.
-
-### Tests
-
-Run from the `backend` directory:
-
-```powershell
-pytest
-```
-
-## React frontend
-
-Start the backend from the `backend` directory as described above. Then, in a
-second terminal, configure and start the frontend:
-
-```powershell
-cd ..\frontend
+cd frontend
 Copy-Item .env.example .env.local
-npm install
-npm run dev
+npm ci
+npm run dev -- --host 127.0.0.1
 ```
 
-Set `API_KEY` in `frontend\.env.local` to the same value configured for the
-backend. `BACKEND_API_URL` defaults to `http://127.0.0.1:8000`; change it if
-the API is running elsewhere. The Vite development proxy reads these values
-server-side.
+Set `API_KEY` in `frontend\.env.local` to match `backend\.env`.
+`BACKEND_API_URL` defaults to `http://127.0.0.1:8000`.
 
-The UI loads available providers and appointment times from `GET /slots`,
-creates bookings with `POST /bookings`, and uses the existing booking lookup,
-history, and cancellation endpoints. No mock slot or booking data is duplicated
-in the frontend.
+- App: <http://127.0.0.1:5173>
+- API docs: <http://127.0.0.1:8000/docs>
 
-## Deploy to Vercel
+The frontend proxy adds the required `X-API-Key` header server-side.
 
-Deploy this repository as two Vercel projects, both connected to the same
-GitHub repository:
+> **Warning:** `POST /reset` deletes all bookings and slots, then replaces
+> slots from its request. Use only with a development/test database. The
+> deployed frontend proxy does not expose this route.
 
-1. **Backend project:** set the Root Directory to `backend`. Vercel detects the
-   FastAPI app in `app\main.py` and installs `requirements.txt`. Pinning is
-   provided by `backend\.python-version` (Python 3.12). Add `DATABASE_URL` and
-   `API_KEY` as server-side environment variables. Use a persistent Supabase
-   PostgreSQL URL; a pooler URL is recommended for serverless connections.
-2. **Frontend project:** set the Root Directory to `frontend` and use the Vite
-   build (`npm run build`, output directory `dist`). Add `BACKEND_API_URL` as
-   the backend project's HTTPS origin (without an `/api` path), and set
-   `API_KEY` to the same secret used by the backend. The Node function at
-   `api\[...path].js` forwards allowed API requests and adds the key
-   server-side. Do not name this variable `VITE_API_KEY` or expose it in
-   browser code.
+## API
 
-Set variables for each Vercel environment you will deploy (Production and,
-optionally, Preview), then redeploy after changing them. Enable Vercel System
-Environment Variables for the backend; the app uses `VERCEL` to reject a
-missing or SQLite `DATABASE_URL` and to avoid retaining database connections
-between serverless invocations.
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/slots` | List slots; optionally filter by provider |
+| `POST` | `/bookings` | Create booking; optional `Idempotency-Key` |
+| `GET` | `/bookings/{id}` | Find a booking |
+| `GET` | `/bookings?email=...` | Email history; optional `limit` and `cursor` |
+| `DELETE` | `/bookings/{id}` | Cancel a booking |
+| `POST` | `/reset` | Replace slots and delete bookings (development only) |
 
-Before deploying the backend, verify the linked Supabase project is the
-intended deployment database and that its existing migration history is
-correct. Then apply pending migrations from the repository root:
+History defaults to 10 results per page; `limit` can be 1–50.
 
-```powershell
-npx --yes supabase@3.1.0 db push --remote
-```
+## Tests
 
-For a database that already has the initial schema, this applies the pending
-rate-limiting migration that creates `booking_attempts`. It does not seed or
-reset clinic data. Do not run the seed script or `POST /reset` against an
-existing clinic database unless you explicitly intend those changes.
+From `backend`, run `pytest`. Tests create and drop isolated schemas in the
+configured database: use a development/test project, never production.
 
-Deploy the backend first, set its HTTPS origin in the frontend project's
-`BACKEND_API_URL`, then deploy the frontend. The browser calls the same-origin
-`/api` proxy; it never receives the API key.
-
-Run the frontend proxy test and production build from `frontend`:
+From `frontend`, run:
 
 ```powershell
 npm test
 npm run build
 ```
+
+## Deploy to Vercel
+
+Create separate backend and frontend projects from this repository:
+
+1. **Backend:** Root Directory `backend`; configure server-side `DATABASE_URL`
+   and `API_KEY`. Use persistent Supabase PostgreSQL and enable Vercel System
+   Environment Variables.
+2. **Frontend:** Root Directory `frontend`; build with `npm run build`, output
+   `dist`; set `BACKEND_API_URL` to the backend HTTPS origin and `API_KEY` to
+   the same secret.
+
+Apply reviewed migrations before deploying the backend. Deploy it first, then
+configure its URL and deploy the frontend. Its `/api` proxy forwards supported
+routes and adds the key server-side.

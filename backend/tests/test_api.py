@@ -1,33 +1,49 @@
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from threading import Barrier
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.engine import URL
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db import Base, get_db
+from app.db import DATABASE_URL, Base, engine as database_engine, get_db
 from app.migrate import migrate
 from app.main import app, enforce_booking_attempt_limit, list_bookings
 from app.models import Booking, CONFIRMED_BOOKING_INDEX, Slot
 
 
 @pytest.fixture()
+def isolated_engine() -> Generator[Engine, None, None]:
+    schema_name = f"test_{uuid4().hex}"
+    with database_engine.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+
+    test_engine = create_engine(
+        DATABASE_URL,
+        connect_args={"options": f"-c search_path={schema_name}"},
+        pool_pre_ping=True,
+    )
+    try:
+        yield test_engine
+    finally:
+        test_engine.dispose()
+        with database_engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema_name}" CASCADE'))
+
+
+@pytest.fixture()
 def client(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, isolated_engine: Engine
 ) -> Generator[TestClient, None, None]:
     monkeypatch.setenv("API_KEY", "test-api-key")
-    test_engine = create_engine(
-        URL.create("sqlite", database=str(tmp_path / "test.db")),
-        connect_args={"check_same_thread": False, "timeout": 15},
+    testing_session = sessionmaker(
+        bind=isolated_engine, autoflush=False, expire_on_commit=False
     )
-    testing_session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
-    Base.metadata.create_all(test_engine)
+    Base.metadata.create_all(isolated_engine)
 
     def override_get_db() -> Generator[Session, None, None]:
         db = testing_session()
@@ -46,8 +62,7 @@ def client(
             yield test_client
     finally:
         app.dependency_overrides.clear()
-        Base.metadata.drop_all(test_engine)
-        test_engine.dispose()
+        Base.metadata.drop_all(isolated_engine)
 
 
 def sample_slots() -> list[dict[str, str]]:
@@ -376,123 +391,113 @@ def test_simultaneous_booking_attempts_enforce_per_email_limit(client: TestClien
     assert len(history["bookings"]) == 5
 
 
-def test_database_index_rejects_duplicate_confirmed_bookings() -> None:
-    test_engine = create_engine(
-        URL.create("sqlite", database=":memory:"),
-        connect_args={"check_same_thread": False},
-    )
-    Base.metadata.create_all(test_engine)
-    test_session = sessionmaker(bind=test_engine, expire_on_commit=False)
+def test_database_index_rejects_duplicate_confirmed_bookings(
+    isolated_engine: Engine,
+) -> None:
+    Base.metadata.create_all(isolated_engine)
+    test_session = sessionmaker(bind=isolated_engine, expire_on_commit=False)
 
-    try:
-        with test_session.begin() as db:
-            db.add(
-                Slot(
-                    id="indexed",
-                    provider="Dr Ade",
-                    start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
-                    end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
-                )
+    with test_session.begin() as db:
+        db.add(
+            Slot(
+                id="indexed",
+                provider="Dr Ade",
+                start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
+                end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
             )
-        with pytest.raises(IntegrityError):
-            with test_session.begin() as db:
-                db.add_all(
-                    [
-                        Booking(slot_id="indexed", name="One", email="one@example.com"),
-                        Booking(slot_id="indexed", name="Two", email="two@example.com"),
-                    ]
-                )
-                db.flush()
-    finally:
-        test_engine.dispose()
-
-
-def test_migration_adds_confirmed_booking_index_idempotently() -> None:
-    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
-    Base.metadata.create_all(test_engine)
-    CONFIRMED_BOOKING_INDEX.drop(test_engine, checkfirst=True)
-
-    try:
-        migrate(test_engine)
-        migrate(test_engine)
-
-        indexes = inspect(test_engine).get_indexes("bookings")
-        assert any(
-            index["name"] == "uq_bookings_one_confirmed_per_slot"
-            and index["unique"]
-            for index in indexes
         )
-    finally:
-        test_engine.dispose()
-
-
-def test_migration_reports_preexisting_duplicate_confirmed_bookings() -> None:
-    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
-    Base.metadata.create_all(test_engine)
-    CONFIRMED_BOOKING_INDEX.drop(test_engine, checkfirst=True)
-    test_session = sessionmaker(bind=test_engine, expire_on_commit=False)
-
-    try:
-        with test_session.begin() as db:
-            db.add(
-                Slot(
-                    id="duplicate",
-                    provider="Dr Ade",
-                    start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
-                    end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
-                )
-            )
+    with pytest.raises(IntegrityError):
         with test_session.begin() as db:
             db.add_all(
                 [
-                    Booking(slot_id="duplicate", name="One", email="one@example.com"),
-                    Booking(slot_id="duplicate", name="Two", email="two@example.com"),
+                    Booking(slot_id="indexed", name="One", email="one@example.com"),
+                    Booking(slot_id="indexed", name="Two", email="two@example.com"),
                 ]
             )
-
-        with pytest.raises(RuntimeError, match="multiple confirmed bookings"):
-            migrate(test_engine)
-    finally:
-        test_engine.dispose()
+            db.flush()
 
 
-def test_migration_adds_level_four_columns_and_level_five_storage_to_existing_database() -> None:
-    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
-    with test_engine.begin() as connection:
+def test_migration_adds_confirmed_booking_index_idempotently(
+    isolated_engine: Engine,
+) -> None:
+    Base.metadata.create_all(isolated_engine)
+    CONFIRMED_BOOKING_INDEX.drop(isolated_engine, checkfirst=True)
+
+    migrate(isolated_engine)
+    migrate(isolated_engine)
+
+    indexes = inspect(isolated_engine).get_indexes("bookings")
+    assert any(
+        index["name"] == "uq_bookings_one_confirmed_per_slot"
+        and index["unique"]
+        for index in indexes
+    )
+
+
+def test_migration_reports_preexisting_duplicate_confirmed_bookings(
+    isolated_engine: Engine,
+) -> None:
+    Base.metadata.create_all(isolated_engine)
+    CONFIRMED_BOOKING_INDEX.drop(isolated_engine, checkfirst=True)
+    test_session = sessionmaker(bind=isolated_engine, expire_on_commit=False)
+
+    with test_session.begin() as db:
+        db.add(
+            Slot(
+                id="duplicate",
+                provider="Dr Ade",
+                start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
+                end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
+            )
+        )
+    with test_session.begin() as db:
+        db.add_all(
+            [
+                Booking(slot_id="duplicate", name="One", email="one@example.com"),
+                Booking(slot_id="duplicate", name="Two", email="two@example.com"),
+            ]
+        )
+
+    with pytest.raises(RuntimeError, match="multiple confirmed bookings"):
+        migrate(isolated_engine)
+
+
+def test_migration_adds_level_four_columns_and_level_five_storage_to_existing_database(
+    isolated_engine: Engine,
+) -> None:
+    with isolated_engine.begin() as connection:
         connection.exec_driver_sql(
             "CREATE TABLE slots (id VARCHAR PRIMARY KEY, provider VARCHAR NOT NULL, "
-            "start DATETIME NOT NULL, end DATETIME NOT NULL)"
+            "start TIMESTAMP WITH TIME ZONE NOT NULL, "
+            '"end" TIMESTAMP WITH TIME ZONE NOT NULL)'
         )
         connection.exec_driver_sql(
             "CREATE TABLE bookings (id VARCHAR PRIMARY KEY, slot_id VARCHAR NOT NULL, "
             "name VARCHAR NOT NULL, email VARCHAR NOT NULL, status VARCHAR NOT NULL, "
-            "created_at DATETIME NOT NULL)"
+            "created_at TIMESTAMP WITH TIME ZONE NOT NULL)"
         )
 
-    try:
-        migrate(test_engine)
-        migrate(test_engine)
+    migrate(isolated_engine)
+    migrate(isolated_engine)
 
-        columns = {column["name"] for column in inspect(test_engine).get_columns("bookings")}
-        indexes = {index["name"] for index in inspect(test_engine).get_indexes("bookings")}
-        assert {
-            "idempotency_key",
-            "request_fingerprint",
-            "idempotency_response",
-            "idempotency_status_code",
-        } <= columns
-        assert "uq_bookings_one_confirmed_per_slot" in indexes
-        assert "uq_bookings_idempotency_key" in indexes
-        assert "booking_attempts" in inspect(test_engine).get_table_names()
-        attempt_indexes = {
-            index["name"] for index in inspect(test_engine).get_indexes("booking_attempts")
-        }
-        assert {
-            "ix_booking_attempts_email_time",
-            "ix_booking_attempts_attempted_at",
-        } <= attempt_indexes
-    finally:
-        test_engine.dispose()
+    columns = {column["name"] for column in inspect(isolated_engine).get_columns("bookings")}
+    indexes = {index["name"] for index in inspect(isolated_engine).get_indexes("bookings")}
+    assert {
+        "idempotency_key",
+        "request_fingerprint",
+        "idempotency_response",
+        "idempotency_status_code",
+    } <= columns
+    assert "uq_bookings_one_confirmed_per_slot" in indexes
+    assert "uq_bookings_idempotency_key" in indexes
+    assert "booking_attempts" in inspect(isolated_engine).get_table_names()
+    attempt_indexes = {
+        index["name"] for index in inspect(isolated_engine).get_indexes("booking_attempts")
+    }
+    assert {
+        "ix_booking_attempts_email_time",
+        "ix_booking_attempts_attempted_at",
+    } <= attempt_indexes
 
 
 def test_simultaneous_booking_requests_only_confirm_one(client: TestClient) -> None:
@@ -607,47 +612,46 @@ def test_booking_history_default_limit_and_cursor_pagination(client: TestClient)
     ] == created_ids
 
 
-def test_booking_history_cursor_uses_id_to_break_timestamp_ties() -> None:
-    test_engine = create_engine(URL.create("sqlite", database=":memory:"))
-    Base.metadata.create_all(test_engine)
-    test_session = sessionmaker(bind=test_engine, expire_on_commit=False)
+def test_booking_history_cursor_uses_id_to_break_timestamp_ties(
+    isolated_engine: Engine,
+) -> None:
+    Base.metadata.create_all(isolated_engine)
+    test_session = sessionmaker(bind=isolated_engine, expire_on_commit=False)
     timestamp = datetime(2026, 12, 1, 10, tzinfo=timezone.utc)
 
-    try:
-        with test_session.begin() as db:
-            for suffix in ("a", "b", "c"):
-                db.add(
-                    Slot(
-                        id=f"tie-{suffix}",
-                        provider="Dr Ade",
-                        start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
-                        end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
-                    )
+    with test_session.begin() as db:
+        for suffix in ("a", "b", "c"):
+            db.add(
+                Slot(
+                    id=f"tie-{suffix}",
+                    provider="Dr Ade",
+                    start_at=datetime(2026, 12, 10, 9, tzinfo=timezone.utc),
+                    end_at=datetime(2026, 12, 10, 9, 30, tzinfo=timezone.utc),
                 )
-                db.add(
-                    Booking(
-                        id=f"booking-{suffix}",
-                        slot_id=f"tie-{suffix}",
-                        name=f"Patient {suffix}",
-                        email="ties@example.com",
-                        created_at=timestamp,
-                    )
-                )
-
-        with test_session() as db:
-            first = list_bookings("ties@example.com", 2, None, db)
-            second = list_bookings(
-                "ties@example.com", 2, first.next_cursor, db
             )
 
-        assert [booking.id for booking in first.bookings] == [
-            "booking-a",
-            "booking-b",
-        ]
-        assert [booking.id for booking in second.bookings] == ["booking-c"]
-        assert second.next_cursor is None
-    finally:
-        test_engine.dispose()
+    with test_session.begin() as db:
+        for suffix in ("a", "b", "c"):
+            db.add(
+                Booking(
+                    id=f"booking-{suffix}",
+                    slot_id=f"tie-{suffix}",
+                    name=f"Patient {suffix}",
+                    email="ties@example.com",
+                    created_at=timestamp,
+                )
+            )
+
+    with test_session() as db:
+        first = list_bookings("ties@example.com", 2, None, db)
+        second = list_bookings("ties@example.com", 2, first.next_cursor, db)
+
+    assert [booking.id for booking in first.bookings] == [
+        "booking-a",
+        "booking-b",
+    ]
+    assert [booking.id for booking in second.bookings] == ["booking-c"]
+    assert second.next_cursor is None
 
 
 def test_booking_history_supports_custom_limit_and_rejects_invalid_limits(

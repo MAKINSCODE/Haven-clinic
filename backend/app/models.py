@@ -56,7 +56,6 @@ CONFIRMED_BOOKING_INDEX = Index(
     Booking.slot_id,
     unique=True,
     postgresql_where=text("status = 'confirmed'"),
-    sqlite_where=text("status = 'confirmed'"),
 )
 
 IDEMPOTENCY_KEY_INDEX = Index(
@@ -64,5 +63,4 @@ IDEMPOTENCY_KEY_INDEX = Index(
     Booking.idempotency_key,
     unique=True,
     postgresql_where=text("idempotency_key IS NOT NULL"),
-    sqlite_where=text("idempotency_key IS NOT NULL"),
 )
