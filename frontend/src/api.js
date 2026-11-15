@@ -1,4 +1,20 @@
 // Browser requests stay same-origin; the server proxy adds the private API key.
+function getErrorMessage(result) {
+  for (const value of [result?.error, result?.detail]) {
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+    if (value && typeof value === "object") {
+      for (const key of ["message", "detail", "msg"]) {
+        if (typeof value[key] === "string" && value[key].trim()) {
+          return value[key];
+        }
+      }
+    }
+  }
+  return "The request could not be completed.";
+}
+
 async function request(path, options = {}) {
   let response;
   try {
@@ -16,7 +32,7 @@ async function request(path, options = {}) {
 
   const result = await response.json();
   if (!response.ok) {
-    throw new Error(result.error || "The request could not be completed.");
+    throw new Error(getErrorMessage(result));
   }
   return result;
 }
