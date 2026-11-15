@@ -1,10 +1,10 @@
 # Clinic Appointment Booking System
 
-## Level 4: idempotency and booking history API
+## Level 5: booking API, idempotency, history, and rate limiting
 
-This level implements the basic REST API with a FastAPI backend, SQLAlchemy
-models, and PostgreSQL support. Exactly two tables are used: `slots` and
-`bookings`.
+The FastAPI backend uses SQLAlchemy and supports PostgreSQL. The `slots` and
+`bookings` tables store appointment data; `booking_attempts` stores hashed-email
+attempt timestamps for rate limiting.
 
 ### Setup
 
@@ -36,7 +36,8 @@ does not run automatically when the API starts.
 
 After deploying the latest code to an existing database, run this migration
 once before serving booking requests. It adds the partial unique indexes and
-nullable idempotency columns to the existing `bookings` table:
+nullable idempotency columns to `bookings`, and creates the `booking_attempts`
+table and its indexes:
 
 ```powershell
 python -m app.migrate
@@ -44,7 +45,7 @@ python -m app.migrate
 
 The migration stops with an explicit error if the database already contains
 multiple confirmed bookings for a slot or duplicate non-null idempotency keys;
-resolve those records before retrying. It does not create another table.
+resolve those records before retrying.
 
 Start the API from the `backend` directory:
 
@@ -72,6 +73,12 @@ it with a different request returns `422`. Booking history is filtered by
 email, ordered oldest first, and uses an opaque cursor based on creation time
 and booking ID. The `limit` is between 1 and 50 and defaults to 10.
 
+`GET /slots` returns `{"slots": [...]}`. `POST /bookings` limits each email to
+five attempts in a rolling minute, including requests that later fail booking
+validation or rules. The sixth attempt returns `429` and a `Retry-After`
+header. Attempt records contain an HMAC of the normalized email, not the email
+itself, and expired records are removed as new attempts arrive.
+
 ## Supabase CLI and PostgreSQL
 
 The Supabase CLI project config is in `supabase\`. Run the pinned CLI version
@@ -92,11 +99,15 @@ npx --yes supabase@3.1.0 link --project-ref "your-project-ref"
 ```
 
 The initial migration creates the `slots` and `bookings` tables, booking
-uniqueness indexes, and row-level security. It revokes direct table access
-from the `anon` and `authenticated` API roles; the FastAPI backend connects
-with the server-side PostgreSQL credentials. Review the migration, then apply it to the linked hosted project with
+uniqueness indexes, and row-level security. The later rate-limiting migration
+creates `booking_attempts` and its indexes, also with row-level security and
+revoked direct table access. The FastAPI backend connects with server-side
+PostgreSQL credentials. Review the migrations, then apply them to the linked
+hosted project with
 `--remote`. Without that flag, the CLI targets the local Supabase stack and
-requires Docker. Apply this baseline migration only to a new, empty project:
+requires Docker. Apply the baseline migration only to a new, empty project.
+On an existing project with the initial migration recorded, this applies only
+new migrations:
 
 ```powershell
 npx --yes supabase@3.1.0 db push --remote

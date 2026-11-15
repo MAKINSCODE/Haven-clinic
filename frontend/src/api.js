@@ -21,8 +21,11 @@ async function request(path, options = {}) {
   return result;
 }
 
-export function getSlots() {
-  return request("/slots");
+export async function getSlots() {
+  const result = await request("/slots");
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result?.slots)) return result.slots;
+  throw new Error("The booking service returned an unexpected slots response.");
 }
 
 export function createBooking(booking, idempotencyKey) {
@@ -38,6 +41,10 @@ export function getBookingHistory(email, { cursor, limit } = {}) {
   if (cursor) params.set("cursor", cursor);
   if (limit) params.set("limit", String(limit));
   return request(`/bookings?${params.toString()}`);
+}
+
+export function getBooking(bookingId) {
+  return request(`/bookings/${encodeURIComponent(bookingId)}`);
 }
 
 export function cancelBooking(bookingId) {

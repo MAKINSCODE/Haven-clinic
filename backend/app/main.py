@@ -1,22 +1,26 @@
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import logging
-from datetime import datetime, timezone
+import math
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import Engine, and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import require_api_key
 from app.db import get_db
-from app.models import Booking, Slot
+from app.models import Booking, BookingAttempt, Slot
 from app.schemas import (
     BookingHistoryResponse,
     BookingResponse,
@@ -24,10 +28,13 @@ from app.schemas import (
     NewBooking,
     ResetRequest,
     SlotAvailability,
+    SlotListResponse,
     slot_response,
 )
 
 logger = logging.getLogger(__name__)
+BOOKING_ATTEMPT_LIMIT = 5
+BOOKING_ATTEMPT_WINDOW = timedelta(minutes=1)
 app = FastAPI(
     title="Clinic Appointment Booking API",
     dependencies=[Depends(require_api_key)],
@@ -99,6 +106,99 @@ def as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def record_booking_attempt(bind: Engine, email: str) -> int | None:
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="API key is not configured")
+    email_hash = hmac.new(
+        api_key.encode("utf-8"),
+        email.strip().lower().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    retry_after: int | None = None
+    lock_id = int.from_bytes(bytes.fromhex(email_hash[:16]), "big", signed=True)
+
+    with Session(bind=bind) as db:
+        with db.begin():
+            dialect_name = bind.dialect.name
+            if dialect_name == "sqlite":
+                # SQLite has no row-level locks; a write serializes rate-limit checks.
+                db.execute(
+                    update(BookingAttempt)
+                    .where(BookingAttempt.id == "__rate_limit_write_lock__")
+                    .values(attempted_at=BookingAttempt.attempted_at)
+                )
+            elif dialect_name == "postgresql":
+                db.execute(
+                    text("SELECT pg_advisory_xact_lock(CAST(:lock_id AS BIGINT))"),
+                    {"lock_id": lock_id},
+                )
+            else:
+                raise RuntimeError(
+                    f"Unsupported database dialect for rate limiting: {dialect_name}"
+                )
+
+            now = current_utc_time()
+            cutoff = now - BOOKING_ATTEMPT_WINDOW
+            attempts = db.scalars(
+                select(BookingAttempt.attempted_at)
+                .where(
+                    BookingAttempt.email_hash == email_hash,
+                    BookingAttempt.attempted_at >= cutoff,
+                )
+                .order_by(BookingAttempt.attempted_at)
+            ).all()
+
+            if len(attempts) >= BOOKING_ATTEMPT_LIMIT:
+                oldest_attempt = as_utc(attempts[0])
+                retry_after = max(
+                    1,
+                    math.ceil(
+                        (
+                            oldest_attempt
+                            + BOOKING_ATTEMPT_WINDOW
+                            - now
+                        ).total_seconds()
+                    ),
+                )
+            else:
+                db.add(BookingAttempt(email_hash=email_hash, attempted_at=now))
+                db.flush()
+
+        with db.begin():
+            db.execute(
+                delete(BookingAttempt).where(BookingAttempt.attempted_at < cutoff)
+            )
+
+    return retry_after
+
+
+async def enforce_booking_attempt_limit(
+    request: Request,
+    _api_key: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> None:
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("email"), str):
+        return
+
+    email = payload["email"].strip()
+    if not email:
+        return
+
+    retry_after = await run_in_threadpool(record_booking_attempt, db.get_bind(), email)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="too many booking attempts",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def lock_slot(db: Session, slot_id: str) -> Slot | None:
@@ -207,18 +307,18 @@ def reset(request: ResetRequest, db: Session = Depends(get_db)) -> Response:
     return Response(status_code=200)
 
 
-@app.get("/slots", response_model=list[SlotAvailability])
+@app.get("/slots", response_model=SlotListResponse)
 def list_slots(
     provider: str | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[SlotAvailability]:
+) -> SlotListResponse:
     query = select(Slot).order_by(Slot.start_at, Slot.id)
     if provider is not None:
         query = query.where(Slot.provider == provider)
     slots = db.scalars(query).all()
 
     if not slots:
-        return []
+        return SlotListResponse(slots=[])
 
     confirmed_slot_ids = set(
         db.scalars(
@@ -228,16 +328,35 @@ def list_slots(
             )
         ).all()
     )
-    return [
-        slot_response(slot, available=slot.id not in confirmed_slot_ids)
-        for slot in slots
-    ]
+    return SlotListResponse(
+        slots=[
+            slot_response(slot, available=slot.id not in confirmed_slot_ids)
+            for slot in slots
+        ]
+    )
 
 
-@app.post("/bookings", response_model=BookingResponse, status_code=201)
+@app.post(
+    "/bookings",
+    response_model=BookingResponse,
+    status_code=201,
+    responses={
+        429: {
+            "model": ErrorResponse,
+            "description": "More than five booking attempts were made for this email in one minute.",
+            "headers": {
+                "Retry-After": {
+                    "description": "Seconds until another booking attempt is allowed.",
+                    "schema": {"type": "integer"},
+                }
+            },
+        }
+    },
+)
 def create_booking(
     booking: NewBooking,
     response: Response,
+    _rate_limit: None = Depends(enforce_booking_attempt_limit),
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     db: Session = Depends(get_db),
 ) -> BookingResponse:

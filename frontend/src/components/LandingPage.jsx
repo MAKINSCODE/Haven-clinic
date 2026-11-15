@@ -1,6 +1,6 @@
 import React from "react";
 
-export default function LandingPage({ onBook, onViewBookings }) {
+export default function LandingPage({ onBook, onGetBooking, onBookingHistory }) {
   return (
     <section aria-labelledby="page-title" className="landing">
       <p className="eyebrow">HAVEN CLINIC</p>
@@ -14,8 +14,11 @@ export default function LandingPage({ onBook, onViewBookings }) {
         <button className="button button-primary" onClick={onBook} type="button">
           Book an Appointment <span aria-hidden="true">→</span>
         </button>
-        <button className="button button-secondary" onClick={onViewBookings} type="button">
-          My Bookings
+        <button className="button button-secondary" onClick={onGetBooking} type="button">
+          Find booking
+        </button>
+        <button className="button button-secondary" onClick={onBookingHistory} type="button">
+          Booking History
         </button>
       </div>
       <div className="mission">

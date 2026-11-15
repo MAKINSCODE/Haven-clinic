@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db import Base, get_db
 from app.migrate import migrate
-from app.main import app, list_bookings
+from app.main import app, enforce_booking_attempt_limit, list_bookings
 from app.models import Booking, CONFIRMED_BOOKING_INDEX, Slot
 
 
@@ -91,12 +91,15 @@ def test_reset_lists_slots_in_time_order_and_filters_provider(client: TestClient
     assert response.status_code == 200
     assert response.content == b""
 
-    slots = client.get("/slots").json()
+    slots_response = client.get("/slots").json()
+    slots = slots_response["slots"]
     assert [slot["id"] for slot in slots] == ["s2", "s1"]
     assert all(slot["available"] for slot in slots)
     assert is_utc(slots[0]["start"])
-    assert client.get("/slots", params={"provider": "Dr Ade"}).json() == [slots[1]]
-    assert client.get("/slots", params={"provider": "Dr"}).json() == []
+    assert client.get("/slots", params={"provider": "Dr Ade"}).json() == {
+        "slots": [slots[1]]
+    }
+    assert client.get("/slots", params={"provider": "Dr"}).json() == {"slots": []}
 
 
 @pytest.mark.parametrize(
@@ -154,7 +157,7 @@ def test_reset_replaces_slots_and_clears_previous_bookings(client: TestClient) -
     response = client.post("/reset", json={"slots": [sample_slots()[1]]})
 
     assert response.status_code == 200
-    assert [slot["id"] for slot in client.get("/slots").json()] == ["s2"]
+    assert [slot["id"] for slot in client.get("/slots").json()["slots"]] == ["s2"]
     assert client.get(f"/bookings/{booking.json()['id']}").status_code == 404
 
 
@@ -166,7 +169,7 @@ def test_reset_rolls_back_if_replacement_slots_are_invalid(client: TestClient) -
 
     assert response.status_code == 500
     assert response.json() == {"error": "internal server error"}
-    assert [slot["id"] for slot in client.get("/slots").json()] == ["s2", "s1"]
+    assert [slot["id"] for slot in client.get("/slots").json()["slots"]] == ["s2", "s1"]
 
 
 def test_create_and_retrieve_booking_marks_slot_unavailable(client: TestClient) -> None:
@@ -184,7 +187,9 @@ def test_create_and_retrieve_booking_marks_slot_unavailable(client: TestClient) 
     assert booking["email"] == "ada@example.com"
     assert is_utc(booking["created_at"])
     assert client.get(f"/bookings/{booking['id']}").json() == booking
-    slot = next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")
+    slot = next(
+        slot for slot in client.get("/slots").json()["slots"] if slot["id"] == "s1"
+    )
     assert slot["available"] is False
 
 
@@ -271,6 +276,106 @@ def test_bookings_without_idempotency_key_still_work(client: TestClient) -> None
     assert first.json()["id"] != second.json()["id"]
 
 
+def test_booking_attempt_limit_counts_failed_requests_and_returns_retry_after(
+    client: TestClient,
+) -> None:
+    payload = {"slot_id": "missing", "name": "Ada", "email": "ada@example.com"}
+
+    responses = [client.post("/bookings", json=payload) for _ in range(5)]
+    limited = client.post("/bookings", json=payload)
+
+    assert [response.status_code for response in responses] == [404] * 5
+    assert limited.status_code == 429
+    assert limited.json() == {"error": "too many booking attempts"}
+    assert 1 <= int(limited.headers["Retry-After"]) <= 60
+
+
+def test_booking_attempt_limit_counts_validation_failures(client: TestClient) -> None:
+    payload = {
+        "slot_id": "missing",
+        "name": "Ada",
+        "email": "not-an-email",
+    }
+
+    responses = [client.post("/bookings", json=payload) for _ in range(5)]
+    limited = client.post("/bookings", json=payload)
+
+    assert [response.status_code for response in responses] == [400] * 5
+    assert limited.status_code == 429
+
+
+def test_booking_attempt_limit_is_per_email(client: TestClient) -> None:
+    client.post("/reset", json={"slots": sample_slots()})
+    blocked_email = "blocked@example.com"
+    for index in range(5):
+        response = client.post(
+            "/bookings",
+            json={
+                "slot_id": "missing",
+                "name": "Ada",
+                "email": blocked_email.upper() if index % 2 else blocked_email,
+            },
+        )
+        assert response.status_code == 404
+
+    other_email_booking = client.post(
+        "/bookings",
+        json={"slot_id": "s1", "name": "Bola", "email": "other@example.com"},
+    )
+    blocked_email_retry = client.post(
+        "/bookings",
+        json={"slot_id": "s2", "name": "Ada", "email": blocked_email},
+    )
+
+    assert other_email_booking.status_code == 201
+    assert blocked_email_retry.status_code == 429
+
+
+def test_booking_attempt_limit_uses_a_rolling_minute(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [datetime(2026, 12, 1, 10, tzinfo=timezone.utc)]
+    monkeypatch.setattr("app.main.current_utc_time", lambda: now[0])
+    payload = {"slot_id": "missing", "name": "Ada", "email": "ada@example.com"}
+
+    for _ in range(5):
+        assert client.post("/bookings", json=payload).status_code == 404
+
+    assert client.post("/bookings", json=payload).status_code == 429
+    now[0] += timedelta(seconds=61)
+
+    assert client.post("/bookings", json=payload).status_code == 404
+
+
+def test_simultaneous_booking_attempts_enforce_per_email_limit(client: TestClient) -> None:
+    slots = appointment_slots(6)
+    client.post("/reset", json={"slots": slots})
+    barrier = Barrier(6)
+
+    def book(index: int):
+        barrier.wait()
+        return client.post(
+            "/bookings",
+            json={
+                "slot_id": slots[index]["id"],
+                "name": f"Patient {index}",
+                "email": "simultaneous@example.com",
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        requests = [executor.submit(book, index) for index in range(6)]
+        responses = [request.result(timeout=30) for request in requests]
+
+    assert sorted(response.status_code for response in responses) == [201] * 5 + [429]
+    limited_response = next(response for response in responses if response.status_code == 429)
+    assert 1 <= int(limited_response.headers["Retry-After"]) <= 60
+    history = client.get(
+        "/bookings", params={"email": "simultaneous@example.com"}
+    ).json()
+    assert len(history["bookings"]) == 5
+
+
 def test_database_index_rejects_duplicate_confirmed_bookings() -> None:
     test_engine = create_engine(
         URL.create("sqlite", database=":memory:"),
@@ -351,7 +456,7 @@ def test_migration_reports_preexisting_duplicate_confirmed_bookings() -> None:
         test_engine.dispose()
 
 
-def test_migration_adds_level_four_columns_to_existing_database() -> None:
+def test_migration_adds_level_four_columns_and_level_five_storage_to_existing_database() -> None:
     test_engine = create_engine(URL.create("sqlite", database=":memory:"))
     with test_engine.begin() as connection:
         connection.exec_driver_sql(
@@ -378,6 +483,14 @@ def test_migration_adds_level_four_columns_to_existing_database() -> None:
         } <= columns
         assert "uq_bookings_one_confirmed_per_slot" in indexes
         assert "uq_bookings_idempotency_key" in indexes
+        assert "booking_attempts" in inspect(test_engine).get_table_names()
+        attempt_indexes = {
+            index["name"] for index in inspect(test_engine).get_indexes("booking_attempts")
+        }
+        assert {
+            "ix_booking_attempts_email_time",
+            "ix_booking_attempts_attempted_at",
+        } <= attempt_indexes
     finally:
         test_engine.dispose()
 
@@ -402,9 +515,9 @@ def test_simultaneous_booking_requests_only_confirm_one(client: TestClient) -> N
 
     assert sorted(response.status_code for response in responses) == [201, 409]
     assert sum(response.json().get("status") == "confirmed" for response in responses) == 1
-    assert next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")[
-        "available"
-    ] is False
+    assert next(
+        slot for slot in client.get("/slots").json()["slots"] if slot["id"] == "s1"
+    )["available"] is False
 
 
 def test_simultaneous_requests_with_same_idempotency_key_replay_one_booking(
@@ -462,6 +575,7 @@ def test_booking_history_filters_email_case_insensitively_and_orders_oldest_firs
 def test_booking_history_default_limit_and_cursor_pagination(client: TestClient) -> None:
     slots = appointment_slots(12)
     client.post("/reset", json={"slots": slots})
+    app.dependency_overrides[enforce_booking_attempt_limit] = lambda: None
     created_ids = []
     for index, slot in enumerate(slots):
         created = client.post(
@@ -594,9 +708,9 @@ def test_cancel_booking_frees_slot_for_rebooking(client: TestClient) -> None:
 
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
-    assert next(slot for slot in client.get("/slots").json() if slot["id"] == "s1")[
-        "available"
-    ] is True
+    assert next(
+        slot for slot in client.get("/slots").json()["slots"] if slot["id"] == "s1"
+    )["available"] is True
     rebooked = client.post(
         "/bookings",
         json={"slot_id": "s1", "name": "Bola Obi", "email": "bola@example.com"},
@@ -642,7 +756,7 @@ def test_reset_accepts_past_slots(client: TestClient) -> None:
     }
 
     assert client.post("/reset", json={"slots": [past_slot]}).status_code == 200
-    assert client.get("/slots").json()[0]["id"] == "past"
+    assert client.get("/slots").json()["slots"][0]["id"] == "past"
 
 
 @pytest.mark.parametrize(

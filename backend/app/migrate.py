@@ -3,13 +3,14 @@ from sqlalchemy import Engine, func, inspect, select, text
 from app.db import engine
 from app.models import (
     Booking,
+    BookingAttempt,
     CONFIRMED_BOOKING_INDEX,
     IDEMPOTENCY_KEY_INDEX,
 )
 
 
 def migrate(bind: Engine = engine) -> None:
-    """Apply the booking indexes and nullable idempotency columns in place."""
+    """Apply booking indexes, idempotency columns, and rate-limit storage."""
     with bind.begin() as connection:
         duplicate_slots = connection.execute(
             select(Booking.slot_id)
@@ -54,6 +55,9 @@ def migrate(bind: Engine = engine) -> None:
 
         CONFIRMED_BOOKING_INDEX.create(connection, checkfirst=True)
         IDEMPOTENCY_KEY_INDEX.create(connection, checkfirst=True)
+        BookingAttempt.__table__.create(connection, checkfirst=True)
+        for index in BookingAttempt.__table__.indexes:
+            index.create(connection, checkfirst=True)
 
 
 if __name__ == "__main__":

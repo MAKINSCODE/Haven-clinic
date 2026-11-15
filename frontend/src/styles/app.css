@@ -714,6 +714,14 @@ input:focus-visible {
 }
 
 @media (max-width: 390px) {
+  .main-nav {
+    gap: 8px;
+  }
+
+  .nav-link {
+    font-size: 10px;
+  }
+
   .page-content {
     width: calc(100% - 32px);
   }

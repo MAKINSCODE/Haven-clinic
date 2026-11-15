@@ -38,6 +38,18 @@ class Booking(Base):
     idempotency_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class BookingAttempt(Base):
+    __tablename__ = "booking_attempts"
+    __table_args__ = (
+        Index("ix_booking_attempts_email_time", "email_hash", "attempted_at"),
+        Index("ix_booking_attempts_attempted_at", "attempted_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid4()))
+    email_hash: Mapped[str] = mapped_column(String, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 # Only confirmed bookings occupy a slot; cancelled rows remain in booking history.
 CONFIRMED_BOOKING_INDEX = Index(
     "uq_bookings_one_confirmed_per_slot",

@@ -3,14 +3,14 @@ import React, { useEffect, useState } from "react";
 import { cancelBooking, getBookingHistory, getSlots } from "../api.js";
 import { formatDateLong, formatTime } from "../format.js";
 
-function AppointmentDetails({ booking, slot }) {
+function AppointmentDetails({ slot }) {
   return (
     <div className="booking-details">
       <p><strong>{slot ? formatDateLong(slot.start) : "Appointment details"}</strong></p>
       <p>
         {slot
           ? `${formatTime(slot.start)} · ${slot.provider}`
-          : `Slot ID: ${booking.slot_id}`}
+          : "Provider and time are unavailable."}
       </p>
     </div>
   );
@@ -35,7 +35,7 @@ function BookingCard({
         </div>
         <span className={`status status-${booking.status}`}>{booking.status}</span>
       </div>
-      <AppointmentDetails booking={booking} slot={slot} />
+      <AppointmentDetails slot={slot} />
       <p className="booking-patient">{booking.name} <span>·</span> {booking.email}</p>
       {booking.status === "confirmed" ? (
         pendingCancel ? (
@@ -211,8 +211,8 @@ export default function MyBookings({ initialBooking = null }) {
     <section className="stack" aria-labelledby="page-title">
       <div>
         <p className="eyebrow">YOUR APPOINTMENTS</p>
-        <h1 id="page-title" className="title">My Bookings</h1>
-        <p className="lead">Enter your email address to view or cancel an appointment.</p>
+        <h1 id="page-title" className="title">Booking History</h1>
+        <p className="lead">Search by email to view or cancel your bookings.</p>
       </div>
 
       <form

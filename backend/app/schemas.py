@@ -43,6 +43,10 @@ class SlotAvailability(SlotResponse):
     available: bool
 
 
+class SlotListResponse(BaseModel):
+    slots: list[SlotAvailability]
+
+
 class NewBooking(BaseModel):
     slot_id: str
     name: str

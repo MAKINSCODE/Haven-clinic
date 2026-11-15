@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { createBooking, getSlots } from "./api.js";
 import BookingForm from "./components/BookingForm.jsx";
 import Confirmation from "./components/Confirmation.jsx";
+import FindBooking from "./components/FindBooking.jsx";
 import Header from "./components/Header.jsx";
 import LandingPage from "./components/LandingPage.jsx";
 import MyBookings from "./components/MyBookings.jsx";
@@ -17,7 +18,7 @@ export default function App() {
   const [selectedSlot, setSelectedSlot] = useState(null);
   const [booking, setBooking] = useState(null);
   const [bookingSlot, setBookingSlot] = useState(null);
-  const [historyBooking, setHistoryBooking] = useState(null);
+  const [lookupBookingId, setLookupBookingId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
 
@@ -70,20 +71,24 @@ export default function App() {
   }
 
   function viewBooking() {
-    setHistoryBooking(booking);
-    setScreen("history");
+    setLookupBookingId(booking.id);
+    setScreen("lookup");
   }
 
   function openHistory() {
-    setHistoryBooking(null);
     setScreen("history");
+  }
+
+  function openBookingLookup(bookingId = "") {
+    setLookupBookingId(bookingId);
+    setScreen("lookup");
   }
 
   function bookAnother() {
     setSelectedSlot(null);
     setBooking(null);
     setBookingSlot(null);
-    setHistoryBooking(null);
+    setLookupBookingId("");
     setScreen("select");
     refreshSlots();
   }
@@ -122,13 +127,16 @@ export default function App() {
         onBookAnother={bookAnother}
       />
     );
+  } else if (screen === "lookup") {
+    content = <FindBooking initialBookingId={lookupBookingId} />;
   } else if (screen === "history") {
-    content = <MyBookings initialBooking={historyBooking} />;
+    content = <MyBookings />;
   } else {
     content = (
       <LandingPage
         onBook={openBooking}
-        onViewBookings={openHistory}
+        onGetBooking={() => openBookingLookup()}
+        onBookingHistory={openHistory}
       />
     );
   }
@@ -139,7 +147,8 @@ export default function App() {
         screen={screen}
         onHome={() => setScreen("home")}
         onBook={openBooking}
-        onBookings={openHistory}
+        onGetBooking={() => openBookingLookup()}
+        onBookingHistory={openHistory}
       />
       <main className="page-content">{content}</main>
       <footer className="site-footer">

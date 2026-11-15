@@ -1,6 +1,12 @@
 import React from "react";
 
-export default function Header({ screen, onHome, onBook, onBookings }) {
+export default function Header({
+  screen,
+  onHome,
+  onBook,
+  onGetBooking,
+  onBookingHistory,
+}) {
   const bookingActive = ["select", "form", "confirmed"].includes(screen);
   return (
     <header className="site-header">
@@ -19,11 +25,19 @@ export default function Header({ screen, onHome, onBook, onBookings }) {
         </button>
         <button
           type="button"
+          className={screen === "lookup" ? "nav-link active" : "nav-link"}
+          aria-current={screen === "lookup" ? "page" : undefined}
+          onClick={onGetBooking}
+        >
+          Find booking
+        </button>
+        <button
+          type="button"
           className={screen === "history" ? "nav-link active" : "nav-link"}
           aria-current={screen === "history" ? "page" : undefined}
-          onClick={onBookings}
+          onClick={onBookingHistory}
         >
-          My Bookings
+          Booking History
         </button>
       </nav>
     </header>
