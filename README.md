@@ -17,7 +17,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Set `DATABASE_URL` to a Neon PostgreSQL connection string. If it is unset, the
+Set `DATABASE_URL` to a Supabase PostgreSQL connection string for a development
+or test project. If it is unset, the
 backend uses a local SQLite database at `backend\clinic.db`.
 
 Set `API_KEY` in the backend environment before starting the API. Every API
@@ -70,6 +71,52 @@ with the same normalized request replays the original booking response; using
 it with a different request returns `422`. Booking history is filtered by
 email, ordered oldest first, and uses an opaque cursor based on creation time
 and booking ID. The `limit` is between 1 and 50 and defaults to 10.
+
+## Supabase CLI and PostgreSQL
+
+The Supabase CLI project config is in `supabase\`. Run the pinned CLI version
+through `npx` (Node.js 20 or later) without installing a global executable:
+
+```powershell
+npx --yes supabase@3.1.0 --version
+```
+
+Create a new development/test project in the Supabase Dashboard and save its
+database password securely. From the repository root, authenticate and link
+the CLI. `login` prompts for a Supabase personal access token; `link` prompts
+for the database password. Do not put either secret in Git or in browser code.
+
+```powershell
+npx --yes supabase@3.1.0 login
+npx --yes supabase@3.1.0 link --project-ref "your-project-ref"
+```
+
+The initial migration creates the `slots` and `bookings` tables, booking
+uniqueness indexes, and row-level security. It revokes direct table access
+from the `anon` and `authenticated` API roles; the FastAPI backend connects
+with the server-side PostgreSQL credentials. Review the migration, then apply it to the linked hosted project with
+`--remote`. Without that flag, the CLI targets the local Supabase stack and
+requires Docker. Apply this baseline migration only to a new, empty project:
+
+```powershell
+npx --yes supabase@3.1.0 db push --remote
+```
+
+Set `DATABASE_URL` in the backend terminal to the connection string from the
+Supabase Dashboard's **Connect** dialog. If a direct connection is unavailable
+on your network, use the Supabase session pooler connection string. Then run
+the existing idempotent seed script once to add the current sample slots:
+
+```powershell
+Set-Location backend
+$env:DATABASE_URL = "paste-your-development-project-connection-string-here"
+python -m app.seed
+```
+
+The CLI's `supabase\seed.sql` mirrors `backend\app\seed.py` for local Supabase
+resets. Remote database initialization uses the Python seed command above.
+Do not run the baseline migration against a project that already has these
+tables; inspect and pull an existing schema first.
 
 ### Tests
 
