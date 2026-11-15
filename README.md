@@ -115,8 +115,8 @@ npx --yes supabase@3.1.0 db push --remote
 
 Set `DATABASE_URL` in the backend terminal to the connection string from the
 Supabase Dashboard's **Connect** dialog. If a direct connection is unavailable
-on your network, use the Supabase session pooler connection string. Then run
-the existing idempotent seed script once to add the current sample slots:
+on your network, use a Supabase pooler connection string. Run the existing
+seed script only when you intentionally want to add its sample slots:
 
 ```powershell
 Set-Location backend
@@ -152,10 +152,57 @@ npm run dev
 Set `API_KEY` in `frontend\.env.local` to the same value configured for the
 backend. `BACKEND_API_URL` defaults to `http://127.0.0.1:8000`; change it if
 the API is running elsewhere. The Vite development proxy reads these values
-server-side. For a Vercel deployment, configure `BACKEND_API_URL` and `API_KEY`
-as server environment variables for the frontend project.
+server-side.
 
 The UI loads available providers and appointment times from `GET /slots`,
 creates bookings with `POST /bookings`, and uses the existing booking lookup,
 history, and cancellation endpoints. No mock slot or booking data is duplicated
 in the frontend.
+
+## Deploy to Vercel
+
+Deploy this repository as two Vercel projects, both connected to the same
+GitHub repository:
+
+1. **Backend project:** set the Root Directory to `backend`. Vercel detects the
+   FastAPI app in `app\main.py` and installs `requirements.txt`. Pinning is
+   provided by `backend\.python-version` (Python 3.12). Add `DATABASE_URL` and
+   `API_KEY` as server-side environment variables. Use a persistent Supabase
+   PostgreSQL URL; a pooler URL is recommended for serverless connections.
+2. **Frontend project:** set the Root Directory to `frontend` and use the Vite
+   build (`npm run build`, output directory `dist`). Add `BACKEND_API_URL` as
+   the backend project's HTTPS origin (without an `/api` path), and set
+   `API_KEY` to the same secret used by the backend. The Node function at
+   `api\[...path].js` forwards allowed API requests and adds the key
+   server-side. Do not name this variable `VITE_API_KEY` or expose it in
+   browser code.
+
+Set variables for each Vercel environment you will deploy (Production and,
+optionally, Preview), then redeploy after changing them. Enable Vercel System
+Environment Variables for the backend; the app uses `VERCEL` to reject a
+missing or SQLite `DATABASE_URL` and to avoid retaining database connections
+between serverless invocations.
+
+Before deploying the backend, verify the linked Supabase project is the
+intended deployment database and that its existing migration history is
+correct. Then apply pending migrations from the repository root:
+
+```powershell
+npx --yes supabase@3.1.0 db push --remote
+```
+
+For a database that already has the initial schema, this applies the pending
+rate-limiting migration that creates `booking_attempts`. It does not seed or
+reset clinic data. Do not run the seed script or `POST /reset` against an
+existing clinic database unless you explicitly intend those changes.
+
+Deploy the backend first, set its HTTPS origin in the frontend project's
+`BACKEND_API_URL`, then deploy the frontend. The browser calls the same-origin
+`/api` proxy; it never receives the API key.
+
+Run the frontend proxy test and production build from `frontend`:
+
+```powershell
+npm test
+npm run build
+```

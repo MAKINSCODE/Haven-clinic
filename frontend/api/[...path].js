@@ -77,6 +77,10 @@ export default async function handler(request, response) {
       "Content-Type",
       upstream.headers.get("content-type") || "application/json",
     );
+    const retryAfter = upstream.headers.get("retry-after");
+    if (retryAfter) {
+      response.setHeader("Retry-After", retryAfter);
+    }
     return response.send(responseBody);
   } catch (error) {
     console.error("Haven Clinic backend proxy request failed", error);
